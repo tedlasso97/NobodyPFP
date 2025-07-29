@@ -1,3 +1,5 @@
+print("🚀 Starting main.py...")
+
 from apscheduler.schedulers.blocking import BlockingScheduler
 from datetime import datetime, timedelta
 
