@@ -68,10 +68,15 @@ def respond_to_mentions(client_v2):
     try:
         print("🔍 Searching for new mentions...")
         query = "@nobodypfp create a PFP for me"
-        response = client_v2.search_recent_tweets(query=query, since_id=last_seen_id, max_results=10, tweet_fields=["author_id"])
+        response = client_v2.search_recent_tweets(
+            query=query,
+            since_id=last_seen_id,
+            max_results=10,
+            tweet_fields=["author_id"]
+        )
         print("✅ Found tweets:", response.data)
     except Exception as e:
-        print("Error searching tweets:", e)
+        print("❌ Error searching tweets:", e)
         return
 
     if not response.data:
@@ -80,13 +85,13 @@ def respond_to_mentions(client_v2):
 
     new_last_seen_id = last_seen_id
 
-    for tweet in reversed(response.data):
+    for tweet in reversed(response.data):  # Oldest first
         print(f"📨 Processing tweet ID {tweet.id} with text: {tweet.text}")
         text = tweet.text.lower()
         author_id = tweet.author_id
         tweet_id = tweet.id
 
-        if tweet_id > (new_last_seen_id or 0):
+        if new_last_seen_id is None or tweet_id > new_last_seen_id:
             new_last_seen_id = tweet_id
 
         if "create a pfp for me" not in text:
@@ -99,18 +104,18 @@ def respond_to_mentions(client_v2):
             screen_name = user_obj.data.username.lower()
             print("✅ Got user:", screen_name)
         except Exception as e:
-            print("Error fetching user info:", e)
+            print("❌ Error fetching user info:", e)
             continue
 
         if screen_name in recipients:
-            print(f"{screen_name} already got a PFP.")
+            print(f"⚠️ {screen_name} already got a PFP.")
             try:
                 client_v2.create_tweet(
                     text=f"You already received a Nobody PFP @{screen_name}",
                     in_reply_to_tweet_id=tweet_id
                 )
             except Exception as e:
-                print("Error sending duplicate notification:", e)
+                print("❌ Error sending duplicate notification:", e)
             continue
 
         image_file = get_unused_image(used_images)
@@ -129,7 +134,7 @@ def respond_to_mentions(client_v2):
             media = client_v1.media_upload(image_path)
             print("✅ Uploaded media")
         except Exception as e:
-            print("Error uploading media:", e)
+            print("❌ Error uploading media:", e)
             continue
         finally:
             if os.path.exists(TEMP_IMAGE_FILE):
@@ -144,7 +149,7 @@ def respond_to_mentions(client_v2):
             )
             print(f"🎉 Sent PFP {image_file} to @{screen_name}")
         except Exception as e:
-            print("Error posting tweet:", e)
+            print("❌ Error posting tweet:", e)
             continue
 
         used_images.add(image_file)
