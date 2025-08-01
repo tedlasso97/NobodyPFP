@@ -4,9 +4,11 @@ import random
 import requests
 from auth import get_twitter_conn_v1
 
-USED_IMAGES_FILE = "used_images.json"
-RECIPIENTS_FILE = "recipients.json"
-STATE_FILE = "state.json"
+# Use persistent storage
+USED_IMAGES_FILE = "/data/used_images.json"
+RECIPIENTS_FILE = "/data/recipients.json"
+STATE_FILE = "/data/state.json"
+
 B2_IMAGE_BASE_URL = "https://f004.backblazeb2.com/file/NobodyPFPs/"
 TEMP_IMAGE_FILE = "temp_image.png"
 
