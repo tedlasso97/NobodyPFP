@@ -3,19 +3,19 @@ import json
 import random
 import requests
 import time
-import tweepy  # for catching TooManyRequests
-from datetime import datetime
+import tweepy
+from datetime import datetime, timezone
 
-# ── CONFIG ─────────────────────────────────────────────────────────────────────
-USED_IMAGES_FILE  = "/data/used_images.json"
-RECIPIENTS_FILE   = "/data/recipients.json"
-STATE_FILE        = "/data/state.json"
-FAILED_FILE       = "/data/failed.json"
-QUEUE_FILE        = "/data/queue.json"
-B2_IMAGE_BASE_URL = "https://f004.backblazeb2.com/file/NobodyPFPs/"
-TEMP_IMAGE_FILE   = "temp_image.png"
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
+USED_IMAGES_FILE   = "/data/used_images.json"
+RECIPIENTS_FILE    = "/data/recipients.json"
+STATE_FILE         = "/data/state.json"
+FAILED_FILE        = "/data/failed.json"
+QUEUE_FILE         = "/data/queue.json"
+B2_IMAGE_BASE_URL  = "https://f004.backblazeb2.com/file/NobodyPFPs/"
+TEMP_IMAGE_FILE    = "temp_image.png"
 
-# ── HELPERS ────────────────────────────────────────────────────────────────────
+# ─── HELPERS ───────────────────────────────────────────────────────────────────
 def load_json_set(path):
     if os.path.exists(path):
         with open(path, "r") as f:
@@ -46,15 +46,16 @@ def save_queue(queue):
     with open(QUEUE_FILE, "w") as f:
         json.dump(queue, f)
 
-# ── IMAGE FUNCTIONS ─────────────────────────────────────────────────────────────
+# ─── IMAGE FUNCTIONS ───────────────────────────────────────────────────────────
 def get_unused_image(used_images):
     all_images = [f"{i}.png" for i in range(10000)]
     available  = list(set(all_images) - used_images)
     return random.choice(available) if available else None
 
 def download_image(filename):
+    url = f"{B2_IMAGE_BASE_URL}{filename}"
     try:
-        r = requests.get(f"{B2_IMAGE_BASE_URL}{filename}")
+        r = requests.get(url)
         r.raise_for_status()
         with open(TEMP_IMAGE_FILE, "wb") as f:
             f.write(r.content)
@@ -63,7 +64,7 @@ def download_image(filename):
         print(f"❌ Error downloading image: {e}")
         return None
 
-# ── QUEUE BUILDER ────────────────────────────────────────────────────────────────
+# ─── QUEUE BUILDER ──────────────────────────────────────────────────────────────
 def respond_to_mentions(client_v2, client_v1):
     recipients   = load_json_set(RECIPIENTS_FILE)
     failed       = load_json_set(FAILED_FILE)
@@ -72,6 +73,7 @@ def respond_to_mentions(client_v2, client_v1):
     queue        = load_queue()
 
     try:
+        print("🔍 Searching for new mentions…")
         resp = client_v2.search_recent_tweets(
             query="@nobodypfp create a PFP for me -is:retweet",
             since_id=last_seen_id,
@@ -88,11 +90,14 @@ def respond_to_mentions(client_v2, client_v1):
     queued_ids = {job["tweet_id"] for job in queue}
 
     for tw in reversed(tweets):
-        tid = tw.id
+        tid  = tw.id
+        text = tw.text.lower()
+
+        # advance last_seen pointer
         if tid > (new_last or 0):
             new_last = tid
 
-        if "create a pfp for me" not in tw.text.lower():
+        if "create a pfp for me" not in text:
             continue
 
         try:
@@ -112,9 +117,12 @@ def respond_to_mentions(client_v2, client_v1):
         save_state(state)
     save_queue(queue)
 
-# ── QUEUE CONSUMER ──────────────────────────────────────────────────────────────
+# ─── QUEUE CONSUMER ────────────────────────────────────────────────────────────
 def serve_from_queue(client_v1, client_v2):
-    queue       = load_queue()
+    """
+    Upload media via v1.1 then reply via v2, with rate-limit backoff.
+    """
+    queue = load_queue()
     if not queue:
         return
 
@@ -126,11 +134,12 @@ def serve_from_queue(client_v1, client_v2):
     tid = job["tweet_id"]
     usr = job["screen_name"]
 
+    # skip if already handled
     if usr in recipients or usr in failed:
         save_queue(queue)
         return
 
-    # pick & fetch image
+    # pick & download image
     img = get_unused_image(used_images)
     if not img:
         print("⚠️ No unused images left.")
@@ -144,7 +153,7 @@ def serve_from_queue(client_v1, client_v2):
         save_queue(queue)
         return
 
-    # upload media
+    # upload media via v1
     try:
         print(f"📤 Uploading {img}…")
         media = client_v1.media_upload(img_path)
@@ -158,8 +167,8 @@ def serve_from_queue(client_v1, client_v2):
         if os.path.exists(TEMP_IMAGE_FILE):
             os.remove(TEMP_IMAGE_FILE)
 
-    # reply via v2
-    text = random.choice([
+    # craft a randomized reply
+    templates = [
         "Here's your Nobody PFP 👁️ @{screen_name}",
         "Your custom Nobody PFP is ready 👁️ @{screen_name}",
         "All yours 👁️ @{screen_name}",
@@ -167,43 +176,48 @@ def serve_from_queue(client_v1, client_v2):
         "Cooked just for you 👁️ @{screen_name}",
         "Made with nothingness 👁️ @{screen_name}",
         "👁️ For the void... and @{screen_name}",
-    ]).format(screen_name=usr)
+    ]
+    status_text = random.choice(templates).format(screen_name=usr)
 
+    # post reply via v2
     try:
         print(f"📢 Replying to @{usr} (tweet {tid})…")
         client_v2.create_tweet(
-            text=text,
+            text=status_text,
             in_reply_to_tweet_id=tid,
             media_ids=[media.media_id_string]
         )
         print(f"🎉 Sent PFP {img} to @{usr}")
 
     except tweepy.TooManyRequests as e:
-        # **definitive** rate limit hit—sleep until reset
-        reset_ts = int(e.response.headers.get("x-rate-limit-reset", time.time()+60))
-        now_ts   = int(time.time())
-        wait_s   = max(reset_ts - now_ts + 2, 10)
-        print(f"🚫 429 received. will sleep for {wait_s}s until {datetime.utcfromtimestamp(reset_ts)} UTC")
-        # re-queue and sleep
+        # definitive rate-limit hit, back off until reset
+        reset_ts = int(e.response.headers.get("x-rate-limit-reset", time.time() + 60))
+        reset_dt = datetime.fromtimestamp(reset_ts, timezone.utc)
+        wait_s   = max(reset_ts - time.time() + 2, 5)
+
+        print(f"🚫 Rate limit hit. Window resets at {reset_dt.isoformat()}.")
+        print(f"⏳ Sleeping {int(wait_s)}s…")
+
+        # re-queue this job to try again later
         queue.insert(0, job)
         save_queue(queue)
+
         time.sleep(wait_s)
         return
 
     except Exception as e:
         print(f"❌ Reply failed: {e}")
-        # other permanent failures
         failed.add(usr)
         save_json_set(failed, FAILED_FILE)
         save_queue(queue)
         return
 
-    # record success
+    # success: record and throttle
     used_images.add(img)
     recipients.add(usr)
     save_json_set(used_images, USED_IMAGES_FILE)
     save_json_set(recipients, RECIPIENTS_FILE)
     save_queue(queue)
 
-    # small throttle
+    # small throttle to avoid burst
     time.sleep(10)

@@ -7,25 +7,32 @@ from zoneinfo import ZoneInfo
 from auth import get_twitter_conn_v1, get_twitter_conn_v2
 from utils import respond_to_mentions, serve_from_queue
 
-client_v1 = get_twitter_conn_v1()  # for media_upload
-client_v2 = get_twitter_conn_v2()  # for search & create_tweet
+# v1 client for media upload; v2 client for fetching & posting tweets
+client_v1 = get_twitter_conn_v1()
+client_v2 = get_twitter_conn_v2()
 
-def job():
-    now = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Edmonton"))
-    print(f"[{now:%Y-%m-%d %H:%M:%S}] 🔍 Fetching mentions…")
-    respond_to_mentions(client_v2, client_v1)
+def fetch_job():
+    now_local = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Edmonton"))
+    print(f"[{now_local.strftime('%Y-%m-%d %H:%M:%S')}] 🔍 Running fetch job…")
+    try:
+        respond_to_mentions(client_v2, client_v1)
+    except Exception as e:
+        print(f"❌ Unhandled error in fetch job: {e}")
 
 def serve_job():
-    now = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Edmonton"))
-    print(f"[{now:%Y-%m-%d %H:%M:%S}] 🤖 Serving replies…")
-    serve_from_queue(client_v1, client_v2)
+    now_local = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Edmonton"))
+    print(f"[{now_local.strftime('%Y-%m-%d %H:%M:%S')}] 🤖 Running serve job…")
+    try:
+        serve_from_queue(client_v1, client_v2)
+    except Exception as e:
+        print(f"❌ Unhandled error in serve job: {e}")
 
-if __name__ == "__main__":
-    sched = BlockingScheduler()
-    # fetch every 2m
-    sched.add_job(job, 'interval', minutes=2, max_instances=1)
-    # serve (post) every 5m
-    sched.add_job(serve_job, 'interval', minutes=5, max_instances=1)
+if __name__ == '__main__':
+    scheduler = BlockingScheduler()
+    # poll for new mentions every 2 minutes
+    scheduler.add_job(fetch_job, 'interval', minutes=2)
+    # send queued replies every 60 seconds (adjustable)
+    scheduler.add_job(serve_job, 'interval', seconds=60)
 
-    print("✅ Bot running: fetch every 2 m, serve every 5 m.")
-    sched.start()
+    print("✅ Nobody bot is running… fetching every 2 m, serving every 60 s.")
+    scheduler.start()
