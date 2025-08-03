@@ -3,20 +3,17 @@ import json
 import random
 import requests
 import time
-import datetime
 
+# ──── CONFIG ──────────────────────────────────────────────────────────────────
 USED_IMAGES_FILE   = "/data/used_images.json"
 RECIPIENTS_FILE    = "/data/recipients.json"
 STATE_FILE         = "/data/state.json"
 FAILED_FILE        = "/data/failed.json"
 QUEUE_FILE         = "/data/queue.json"
-
 B2_IMAGE_BASE_URL  = "https://f004.backblazeb2.com/file/NobodyPFPs/"
 TEMP_IMAGE_FILE    = "temp_image.png"
 
-# ————————————————
-# Load/save helpers
-# ————————————————
+# ──── HELPERS ─────────────────────────────────────────────────────────────────
 def load_json_set(path):
     if os.path.exists(path):
         with open(path, "r") as f:
@@ -37,28 +34,6 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-# ————————————————
-# Image picker & downloader
-# ————————————————
-def get_unused_image(used_images):
-    all_images = [f"{i}.png" for i in range(0, 10000)]
-    available  = list(set(all_images) - used_images)
-    return random.choice(available) if available else None
-
-def download_image(image_filename):
-    url = f"{B2_IMAGE_BASE_URL}{image_filename}"
-    try:
-        r = requests.get(url); r.raise_for_status()
-        with open(TEMP_IMAGE_FILE, "wb") as f:
-            f.write(r.content)
-        return TEMP_IMAGE_FILE
-    except Exception as e:
-        print(f"❌ Error downloading image: {e}")
-        return None
-
-# ————————————————
-# Queue loading & saving
-# ————————————————
 def load_queue():
     if os.path.exists(QUEUE_FILE):
         with open(QUEUE_FILE, "r") as f:
@@ -69,20 +44,38 @@ def save_queue(queue):
     with open(QUEUE_FILE, "w") as f:
         json.dump(queue, f)
 
-# ————————————————
-# Fetch mentions → build work queue
-# ————————————————
-def respond_to_mentions(client_v2, client_v1):
-    recipients    = load_json_set(RECIPIENTS_FILE)
-    failed        = load_json_set(FAILED_FILE)
-    state         = load_state()
-    last_seen_id  = state.get("last_seen_id")
-    queue         = load_queue()
+# ──── IMAGE FUNCTIONS ─────────────────────────────────────────────────────────
+def get_unused_image(used_images):
+    all_images = [f"{i}.png" for i in range(10000)]
+    available  = list(set(all_images) - used_images)
+    return random.choice(available) if available else None
 
+def download_image(filename):
+    url = f"{B2_IMAGE_BASE_URL}{filename}"
+    try:
+        r = requests.get(url)
+        r.raise_for_status()
+        with open(TEMP_IMAGE_FILE, "wb") as f:
+            f.write(r.content)
+        return TEMP_IMAGE_FILE
+    except Exception as e:
+        print(f"❌ Error downloading image: {e}")
+        return None
+
+# ──── QUEUE BUILDER ────────────────────────────────────────────────────────────
+def respond_to_mentions(client_v2, client_v1=None):
+    """Fetch new mentions via v2, skip RTs, enqueue unique users."""
+    recipients   = load_json_set(RECIPIENTS_FILE)
+    failed       = load_json_set(FAILED_FILE)
+    state        = load_state()
+    last_seen_id = state.get("last_seen_id")
+    queue        = load_queue()
+
+    # fetch
     try:
         print("🔍 Searching for new mentions…")
         resp = client_v2.search_recent_tweets(
-            query="@nobodypfp create a PFP for me",
+            query="@nobodypfp create a PFP for me -is:retweet",
             since_id=last_seen_id,
             max_results=10,
             tweet_fields=["author_id"]
@@ -90,79 +83,83 @@ def respond_to_mentions(client_v2, client_v1):
         tweets = resp.data or []
         print("✅ Found tweets:", tweets)
     except Exception as e:
-        print("❌ Error searching tweets:", e)
+        print(f"❌ Error searching tweets: {e}")
         return
 
-    new_last_seen = last_seen_id
-    queued_ids    = {item["tweet_id"] for item in queue}
+    new_last = last_seen_id
+    queued_ids = {item["tweet_id"] for item in queue}
 
     for tw in reversed(tweets):
-        tid  = tw.id
-        txt  = tw.text.lower()
-        if tid > (new_last_seen or 0):
-            new_last_seen = tid
-        if "create a pfp for me" not in txt:
+        tid = tw.id
+        if tid > (new_last or 0):
+            new_last = tid
+
+        # skip anything not exact phrase
+        text = tw.text.lower()
+        if "create a pfp for me" not in text:
             continue
 
+        # get user
         try:
-            user_obj    = client_v2.get_user(id=tw.author_id)
-            screen_name = user_obj.data.username.lower()
+            usr = client_v2.get_user(id=tw.author_id).data.username.lower()
         except Exception as e:
-            print("❌ Error fetching user:", e)
+            print(f"❌ Error fetching user: {e}")
             continue
 
-        if tid in queued_ids or screen_name in recipients or screen_name in failed:
+        # skip duplicates
+        if tid in queued_ids or usr in recipients or usr in failed:
             continue
 
-        queue.append({
-            "tweet_id":   tid,
-            "author_id":  tw.author_id,
-            "screen_name": screen_name
-        })
+        # enqueue
+        queue.append({"tweet_id": tid, "screen_name": usr})
+        print(f"➕ Queued @{usr} (tweet {tid})")
 
-    if new_last_seen:
-        state["last_seen_id"] = new_last_seen
+    # save state & queue
+    if new_last:
+        state["last_seen_id"] = new_last
         save_state(state)
     save_queue(queue)
 
-# ————————————————
-# Serve replies from queue
-# ————————————————
+# ──── QUEUE CONSUMER ────────────────────────────────────────────────────────────
 def serve_from_queue(client_v1, client_v2):
-    queue       = load_queue()
-    used_images = load_json_set(USED_IMAGES_FILE)
-    recipients  = load_json_set(RECIPIENTS_FILE)
-    failed      = load_json_set(FAILED_FILE)
-
-    print(f"📋 Queue length: {len(queue)}")
+    """Take next job, upload media via v1.1, reply via v2."""
+    queue        = load_queue()
     if not queue:
         return
 
-    job = queue.pop(0)
-    tid  = job["tweet_id"]
-    user = job["screen_name"]
+    used_images  = load_json_set(USED_IMAGES_FILE)
+    recipients   = load_json_set(RECIPIENTS_FILE)
+    failed       = load_json_set(FAILED_FILE)
+    job          = queue.pop(0)
+    tid          = job["tweet_id"]
+    usr          = job["screen_name"]
 
-    if user in recipients or user in failed:
-        save_queue(queue); return
+    # skip if already handled
+    if usr in recipients or usr in failed:
+        save_queue(queue)
+        return
 
-    img_file = get_unused_image(used_images)
-    if not img_file:
-        print("⚠️ No more unused images."); return
+    # pick & fetch image
+    img = get_unused_image(used_images)
+    if not img:
+        print("⚠️ No unused images left.")
+        return
 
-    img_path = download_image(img_file)
+    img_path = download_image(img)
     if not img_path:
-        failed.add(user)
+        print(f"⚠️ Download failed for {img}, marking failed")
+        failed.add(usr)
         save_json_set(failed, FAILED_FILE)
         save_queue(queue)
         return
 
-    # 1️⃣ Upload media via v1.1
+    # upload media
     try:
-        print("📤 Uploading media…")
+        print(f"📤 Uploading {img}…")
         media = client_v1.media_upload(img_path)
     except Exception as e:
-        print("❌ Media upload failed:", e)
-        failed.add(user)
+        print(f"❌ Media upload failed: {e}")
+        failed.add(usr)
         save_json_set(failed, FAILED_FILE)
         save_queue(queue)
         return
@@ -170,8 +167,8 @@ def serve_from_queue(client_v1, client_v2):
         if os.path.exists(TEMP_IMAGE_FILE):
             os.remove(TEMP_IMAGE_FILE)
 
-    # 2️⃣ Post reply via v2
-    responses = [
+    # craft reply
+    templates = [
         "Here's your Nobody PFP 👁️ @{screen_name}",
         "Your custom Nobody PFP is ready 👁️ @{screen_name}",
         "All yours 👁️ @{screen_name}",
@@ -180,28 +177,35 @@ def serve_from_queue(client_v1, client_v2):
         "Made with nothingness 👁️ @{screen_name}",
         "👁️ For the void... and @{screen_name}",
     ]
-    status_text = random.choice(responses).replace("{screen_name}", user)
+    text = random.choice(templates).format(screen_name=usr)
 
+    # post with v2
     try:
-        print("📢 Posting reply via v2…")
+        print(f"📢 Replying to @{usr} (tweet {tid})…")
         client_v2.create_tweet(
-            text=status_text,
+            text=text,
             in_reply_to_tweet_id=tid,
             media_ids=[media.media_id_string]
         )
-        print(f"🎉 Sent PFP {img_file} to @{user}")
+        print(f"🎉 Sent PFP {img} to @{usr}")
     except Exception as e:
-        print("❌ Post failed:", e)
-        failed.add(user)
+        print(f"❌ Reply failed: {e}")
+        failed.add(usr)
         save_json_set(failed, FAILED_FILE)
-        save_queue(queue)
+        # if rate-limit, push back into queue and sleep
+        if "429" in str(e):
+            print("🚫 Rate limit — re-queueing and sleeping 60s…")
+            queue.insert(0, job)
+            save_queue(queue)
+            time.sleep(60)
         return
 
-    used_images.add(img_file)
-    recipients.add(user)
+    # record success
+    used_images.add(img)
+    recipients.add(usr)
     save_json_set(used_images, USED_IMAGES_FILE)
     save_json_set(recipients, RECIPIENTS_FILE)
     save_queue(queue)
 
-    # small delay to stay under rate limits
+    # small throttle
     time.sleep(10)
