@@ -2,35 +2,27 @@ import os
 import json
 import random
 import requests
+import time
 from auth import get_twitter_conn_v1
 
 # Use persistent storage
 USED_IMAGES_FILE = "/data/used_images.json"
 RECIPIENTS_FILE = "/data/recipients.json"
 STATE_FILE = "/data/state.json"
+FAILED_FILE = "/data/failed.json"
 
 B2_IMAGE_BASE_URL = "https://f004.backblazeb2.com/file/NobodyPFPs/"
 TEMP_IMAGE_FILE = "temp_image.png"
 
-def load_used_images():
-    if os.path.exists(USED_IMAGES_FILE):
-        with open(USED_IMAGES_FILE, "r") as f:
+def load_json_set(path):
+    if os.path.exists(path):
+        with open(path, "r") as f:
             return set(json.load(f))
     return set()
 
-def save_used_images(used):
-    with open(USED_IMAGES_FILE, "w") as f:
-        json.dump(list(used), f)
-
-def load_recipients():
-    if os.path.exists(RECIPIENTS_FILE):
-        with open(RECIPIENTS_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
-
-def save_recipients(recipients):
-    with open(RECIPIENTS_FILE, "w") as f:
-        json.dump(list(recipients), f)
+def save_json_set(data_set, path):
+    with open(path, "w") as f:
+        json.dump(list(data_set), f)
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -62,8 +54,9 @@ def download_image(image_filename):
         return None
 
 def respond_to_mentions(client_v2):
-    used_images = load_used_images()
-    recipients = load_recipients()
+    used_images = load_json_set(USED_IMAGES_FILE)
+    recipients = load_json_set(RECIPIENTS_FILE)
+    failed = load_json_set(FAILED_FILE)
     state = load_state()
     last_seen_id = state.get("last_seen_id")
 
@@ -109,15 +102,8 @@ def respond_to_mentions(client_v2):
             print("❌ Error fetching user info:", e)
             continue
 
-        if screen_name in recipients:
-            print(f"⚠️ {screen_name} already got a PFP.")
-            try:
-                client_v2.create_tweet(
-                    text=f"You already received a Nobody PFP @{screen_name}",
-                    in_reply_to_tweet_id=tweet_id
-                )
-            except Exception as e:
-                print("❌ Error sending duplicate notification:", e)
+        if screen_name in recipients or screen_name in failed:
+            print(f"⚠️ Skipping @{screen_name} (already served or failed).")
             continue
 
         image_file = get_unused_image(used_images)
@@ -128,6 +114,7 @@ def respond_to_mentions(client_v2):
         image_path = download_image(image_file)
         if not image_path:
             print("❌ Failed to download image. Skipping.")
+            failed.add(screen_name)
             continue
 
         try:
@@ -137,6 +124,7 @@ def respond_to_mentions(client_v2):
             print("✅ Uploaded media")
         except Exception as e:
             print("❌ Error uploading media:", e)
+            failed.add(screen_name)
             continue
         finally:
             if os.path.exists(TEMP_IMAGE_FILE):
@@ -152,13 +140,23 @@ def respond_to_mentions(client_v2):
             print(f"🎉 Sent PFP {image_file} to @{screen_name}")
         except Exception as e:
             print("❌ Error posting tweet:", e)
+            failed.add(screen_name)
+
+            if "429" in str(e):
+                print("🚫 Rate limit hit — sleeping for 60 seconds.")
+                time.sleep(60)
             continue
 
         used_images.add(image_file)
         recipients.add(screen_name)
-        save_used_images(used_images)
-        save_recipients(recipients)
+        save_json_set(used_images, USED_IMAGES_FILE)
+        save_json_set(recipients, RECIPIENTS_FILE)
+
+        # Delay between tweets to avoid rate limit
+        time.sleep(5)
 
     if new_last_seen_id:
         state["last_seen_id"] = new_last_seen_id
         save_state(state)
+
+    save_json_set(failed, FAILED_FILE)
