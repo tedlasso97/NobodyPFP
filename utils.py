@@ -3,9 +3,7 @@ import json
 import random
 import requests
 import time
-from auth import get_twitter_conn_v1
 
-# Use persistent storage
 USED_IMAGES_FILE = "/data/used_images.json"
 RECIPIENTS_FILE = "/data/recipients.json"
 STATE_FILE = "/data/state.json"
@@ -130,7 +128,7 @@ def respond_to_mentions(client_v2):
 
     save_queue(queue)
 
-def serve_from_queue(client_v2):
+def serve_from_queue(client_v1):
     queue = load_queue()
     used_images = load_json_set(USED_IMAGES_FILE)
     recipients = load_json_set(RECIPIENTS_FILE)
@@ -158,19 +156,20 @@ def serve_from_queue(client_v2):
 
     image_path = download_image(image_file)
     if not image_path:
-        print("❌ Failed to download image. Re-queueing user.")
-        queue.insert(0, current)
+        print("❌ Failed to download image. Skipping.")
+        failed.add(screen_name)
+        save_json_set(failed, FAILED_FILE)
         save_queue(queue)
         return
 
     try:
         print("📤 Uploading image...")
-        client_v1 = get_twitter_conn_v1()
         media = client_v1.media_upload(image_path)
         print("✅ Uploaded media")
     except Exception as e:
         print("❌ Error uploading media:", e)
-        queue.insert(0, current)
+        failed.add(screen_name)
+        save_json_set(failed, FAILED_FILE)
         save_queue(queue)
         return
     finally:
@@ -188,22 +187,20 @@ def serve_from_queue(client_v2):
         print(f"🎉 Sent PFP {image_file} to @{screen_name}")
     except Exception as e:
         print("❌ Error posting tweet:", e)
+        failed.add(screen_name)
+        save_json_set(failed, FAILED_FILE)
+
         if "429" in str(e):
-            print("🚫 Rate limit hit — sleeping for 60 seconds and retrying user later.")
-            queue.insert(0, current)
-            save_queue(queue)
+            print("🚫 Rate limit hit — sleeping for 60 seconds.")
             time.sleep(60)
-            return
-        else:
-            failed.add(screen_name)
 
-    else:
-        used_images.add(image_file)
-        recipients.add(screen_name)
+        save_queue(queue)
+        return
 
+    used_images.add(image_file)
+    recipients.add(screen_name)
     save_json_set(used_images, USED_IMAGES_FILE)
     save_json_set(recipients, RECIPIENTS_FILE)
-    save_json_set(failed, FAILED_FILE)
     save_queue(queue)
 
     time.sleep(10)
