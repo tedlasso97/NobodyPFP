@@ -203,8 +203,20 @@ def serve_from_queue(client_v1):
 
     try:
         print("📢 Posting reply tweet...")
+
+        responses = [
+            "Here's your Nobody PFP 👁️ @{screen_name}",
+            "Your custom Nobody PFP is ready 👁️ @{screen_name}",
+            "All yours 👁️ @{screen_name}",
+            "You asked. We delivered. Nobody PFP 👁️ @{screen_name}",
+            "Cooked just for you 👁️ @{screen_name}",
+            "Made with nothingness 👁️ @{screen_name}",
+            "👁️ For the void... and @{screen_name}",
+        ]
+        status_text = random.choice(responses).replace("{screen_name}", screen_name)
+
         client_v1.update_status(
-            status=f"Here is your Nobody PFP @{screen_name}",
+            status=status_text,
             in_reply_to_status_id=tweet_id,
             auto_populate_reply_metadata=True,
             media_ids=[media.media_id]
