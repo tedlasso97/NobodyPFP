@@ -5,18 +5,15 @@ import requests
 import time
 from auth import get_twitter_conn_v1
 
-# Persistent storage paths
+# Use persistent storage
 USED_IMAGES_FILE = "/data/used_images.json"
 RECIPIENTS_FILE = "/data/recipients.json"
 STATE_FILE = "/data/state.json"
 FAILED_FILE = "/data/failed.json"
 QUEUE_FILE = "/data/queue.json"
 
-# Image configuration
 B2_IMAGE_BASE_URL = "https://f004.backblazeb2.com/file/NobodyPFPs/"
 TEMP_IMAGE_FILE = "temp_image.png"
-
-# --- Utility functions ---
 
 def load_json_set(path):
     if os.path.exists(path):
@@ -66,8 +63,6 @@ def load_queue():
 def save_queue(queue):
     with open(QUEUE_FILE, "w") as f:
         json.dump(queue, f)
-
-# --- Respond: collects eligible tweets into queue ---
 
 def respond_to_mentions(client_v2):
     recipients = load_json_set(RECIPIENTS_FILE)
@@ -135,8 +130,6 @@ def respond_to_mentions(client_v2):
 
     save_queue(queue)
 
-# --- Serve: reply to one tweet from queue ---
-
 def serve_from_queue(client_v2):
     queue = load_queue()
     used_images = load_json_set(USED_IMAGES_FILE)
@@ -165,9 +158,8 @@ def serve_from_queue(client_v2):
 
     image_path = download_image(image_file)
     if not image_path:
-        print("❌ Failed to download image. Skipping.")
-        failed.add(screen_name)
-        save_json_set(failed, FAILED_FILE)
+        print("❌ Failed to download image. Re-queueing user.")
+        queue.insert(0, current)
         save_queue(queue)
         return
 
@@ -178,8 +170,7 @@ def serve_from_queue(client_v2):
         print("✅ Uploaded media")
     except Exception as e:
         print("❌ Error uploading media:", e)
-        failed.add(screen_name)
-        save_json_set(failed, FAILED_FILE)
+        queue.insert(0, current)
         save_queue(queue)
         return
     finally:
@@ -188,29 +179,31 @@ def serve_from_queue(client_v2):
 
     try:
         print("📢 Posting reply tweet...")
-        client_v2.create_tweet(
-            text=f"Here is your Nobody PFP @{screen_name}",
-            in_reply_to_tweet_id=tweet_id,
+        client_v1.update_status(
+            status=f"Here is your Nobody PFP @{screen_name}",
+            in_reply_to_status_id=tweet_id,
+            auto_populate_reply_metadata=True,
             media_ids=[media.media_id]
         )
         print(f"🎉 Sent PFP {image_file} to @{screen_name}")
     except Exception as e:
         print("❌ Error posting tweet:", e)
-        failed.add(screen_name)
-        save_json_set(failed, FAILED_FILE)
-
         if "429" in str(e):
-            print("🚫 Rate limit hit — sleeping for 60 seconds.")
+            print("🚫 Rate limit hit — sleeping for 60 seconds and retrying user later.")
+            queue.insert(0, current)
+            save_queue(queue)
             time.sleep(60)
+            return
+        else:
+            failed.add(screen_name)
 
-        save_queue(queue)
-        return
+    else:
+        used_images.add(image_file)
+        recipients.add(screen_name)
 
-    used_images.add(image_file)
-    recipients.add(screen_name)
     save_json_set(used_images, USED_IMAGES_FILE)
     save_json_set(recipients, RECIPIENTS_FILE)
+    save_json_set(failed, FAILED_FILE)
     save_queue(queue)
 
-    # Sleep to prevent rate limits
     time.sleep(10)
