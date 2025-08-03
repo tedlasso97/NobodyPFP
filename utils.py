@@ -1,187 +1,208 @@
+# utils.py
 import os
 import json
 import random
 import requests
 import time
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-USED_IMAGES_FILE   = "/data/used_images.json"
-RECIPIENTS_FILE    = "/data/recipients.json"
-STATE_FILE         = "/data/state.json"
-FAILED_FILE        = "/data/failed.json"
-QUEUE_FILE         = "/data/queue.json"
+# ─── Config ───────────────────────────────────────────────────────────────────
+USED_IMAGES_FILE  = "/data/used_images.json"
+RECIPIENTS_FILE   = "/data/recipients.json"
+STATE_FILE        = "/data/state.json"
+FAILED_FILE       = "/data/failed.json"
+QUEUE_FILE        = "/data/queue.json"
+B2_IMAGE_BASE_URL = "https://f004.backblazeb2.com/file/NobodyPFPs/"
+TEMP_IMAGE_FILE   = "temp_image.png"
 
-B2_IMAGE_BASE_URL  = "https://f004.backblazeb2.com/file/NobodyPFPs/"
-TEMP_IMAGE_FILE    = "temp_image.png"
-
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
-def load_json_set(path):
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def _load_set(path):
     if os.path.exists(path):
         with open(path, "r") as f:
             return set(json.load(f))
     return set()
 
-def save_json_set(data, path):
+def _save_set(s, path):
     with open(path, "w") as f:
-        json.dump(list(data), f)
+        json.dump(list(s), f)
+
+def _load_json(path, default):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return default
+
+def _save_json(obj, path):
+    with open(path, "w") as f:
+        json.dump(obj, f)
+
+# ─── Queue & State ────────────────────────────────────────────────────────────
+def load_queue():
+    return _load_json(QUEUE_FILE, [])
+
+def save_queue(q):
+    _save_json(q, QUEUE_FILE)
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {"last_seen_id": None}
+    return _load_json(STATE_FILE, {"last_seen_id": None})
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+def save_state(s):
+    _save_json(s, STATE_FILE)
 
-def load_queue():
-    if os.path.exists(QUEUE_FILE):
-        with open(QUEUE_FILE, "r") as f:
-            return json.load(f)
-    return []
-
-def save_queue(queue):
-    with open(QUEUE_FILE, "w") as f:
-        json.dump(queue, f)
-
-# ─── IMAGE FUNCTIONS ──────────────────────────────────────────────────────────
-def get_unused_image(used_images):
-    all_imgs = [f"{i}.png" for i in range(10000)]
-    avail    = list(set(all_imgs) - used_images)
-    return random.choice(avail) if avail else None
-
-def download_image(fn):
-    url = f"{B2_IMAGE_BASE_URL}{fn}"
+# ─── Image download ───────────────────────────────────────────────────────────
+def _download_image(filename):
+    url = f"{B2_IMAGE_BASE_URL}{filename}"
     try:
-        r = requests.get(url); r.raise_for_status()
+        resp = requests.get(url)
+        resp.raise_for_status()
         with open(TEMP_IMAGE_FILE, "wb") as f:
-            f.write(r.content)
+            f.write(resp.content)
         return TEMP_IMAGE_FILE
     except Exception as e:
-        print(f"❌ Error downloading {fn}: {e}")
+        print(f"❌ Image download failed: {e}")
         return None
 
-# ─── QUEUE BUILDER ────────────────────────────────────────────────────────────
-def respond_to_mentions(client_v2, client_v1):
-    recipients   = load_json_set(RECIPIENTS_FILE)
-    failed       = load_json_set(FAILED_FILE)
-    state        = load_state()
-    last_seen    = state.get("last_seen_id")
-    queue        = load_queue()
+def _pick_image(used_set):
+    # assume images are named 0.png … 9999.png
+    all_imgs = {f"{i}.png" for i in range(10_000)}
+    avail = list(all_imgs - used_set)
+    return random.choice(avail) if avail else None
 
-    print("🔍 Searching for new mentions…")
+# ─── Fetch mentions & enqueue ─────────────────────────────────────────────────
+def respond_to_mentions(client_v2, *, batch_size=10):
+    recipients = _load_set(RECIPIENTS_FILE)
+    failed     = _load_set(FAILED_FILE)
+    state      = load_state()
+    queue      = load_queue()
+
+    last_seen = state.get("last_seen_id")
     try:
+        print("🔍 Searching for new mentions…")
         resp = client_v2.search_recent_tweets(
             query="@nobodypfp create a PFP for me -is:retweet",
             since_id=last_seen,
-            max_results=10,
+            max_results=batch_size,
             tweet_fields=["author_id"]
         )
         tweets = resp.data or []
-        print("✅ Found tweets:", [t.id for t in tweets])
+        print(f"✅ Found {len(tweets)} tweets")
     except Exception as e:
-        print(f"❌ Error searching tweets: {e}")
+        print(f"❌ Fetch error: {e}")
         return
 
-    new_last = last_seen
-    queued   = {job["tweet_id"] for job in queue}
+    new_last = last_seen or 0
+    queued_ids = {job["tweet_id"] for job in queue}
 
     for tw in reversed(tweets):
         tid  = tw.id
-        txt  = tw.text.lower()
-        if tid > (new_last or 0):
+        text = tw.text.lower()
+        if tid > new_last:
             new_last = tid
-        if "create a pfp for me" not in txt:
+        if "create a pfp for me" not in text:
             continue
 
-        # fetch username
+        # look up username
         try:
-            usr = client_v2.get_user(id=tw.author_id).data.username.lower()
+            user = client_v2.get_user(id=tw.author_id).data.username.lower()
         except Exception as e:
-            print(f"❌ Error fetching user: {e}")
+            print(f"❌ User lookup failed: {e}")
             continue
 
-        if tid in queued or usr in recipients or usr in failed:
+        if tid in queued_ids or user in recipients or user in failed:
             continue
 
-        queue.append({"tweet_id": tid, "screen_name": usr})
-        print(f"➕ Queued @{usr} (tweet {tid})")
+        queue.append({"tweet_id": tid, "screen_name": user})
+        print(f"➕ Queued @{user} (tweet {tid})")
 
     if new_last:
         state["last_seen_id"] = new_last
         save_state(state)
     save_queue(queue)
 
-# ─── QUEUE CONSUMER ────────────────────────────────────────────────────────────
-def serve_from_queue(client_v1):
-    queue       = load_queue()
+# ─── Serve queued replies ──────────────────────────────────────────────────────
+def serve_from_queue(client_v2, reply_interval_sec=300):
+    queue      = load_queue()
     if not queue:
-        print("📋 Queue empty.")
+        print("📋 Queue empty")
         return
 
-    used_imgs   = load_json_set(USED_IMAGES_FILE)
-    recipients  = load_json_set(RECIPIENTS_FILE)
-    failed      = load_json_set(FAILED_FILE)
+    used       = _load_set(USED_IMAGES_FILE)
+    recipients = _load_set(RECIPIENTS_FILE)
+    failed     = _load_set(FAILED_FILE)
 
-    job         = queue.pop(0)
-    tid         = job["tweet_id"]
-    usr         = job["screen_name"]
+    job = queue.pop(0)
+    tid  = job["tweet_id"]
+    usr  = job["screen_name"]
 
     # skip if already done
     if usr in recipients or usr in failed:
         save_queue(queue)
         return
 
-    img_fn      = get_unused_image(used_imgs)
-    if not img_fn:
-        print("⚠️ No unused images left.")
+    img_name = _pick_image(used)
+    if not img_name:
+        print("⚠️ No images left")
         return
 
-    img_path    = download_image(img_fn)
-    if not img_path:
-        print(f"⚠️ Download failed, marking @{usr} failed.")
-        failed.add(usr); save_json_set(failed, FAILED_FILE)
+    path = _download_image(img_name)
+    if not path:
+        failed.add(usr)
+        _save_set(failed, FAILED_FILE)
         save_queue(queue)
         return
 
-    # upload media
+    # 1) upload via v2
     try:
-        print(f"📤 Uploading {img_fn}…")
-        media = client_v1.media_upload(img_path)
+        print(f"📤 Uploading {img_name}…")
+        media = client_v2.upload_media(filename=path)
+        media_key = media.media_key
     except Exception as e:
         print(f"❌ Media upload failed: {e}")
-        failed.add(usr); save_json_set(failed, FAILED_FILE)
+        failed.add(usr)
+        _save_set(failed, FAILED_FILE)
         save_queue(queue)
         return
     finally:
         if os.path.exists(TEMP_IMAGE_FILE):
             os.remove(TEMP_IMAGE_FILE)
 
-    # post reply via v1.1
-    reply_text = f"Here is your Nobody PFP @{usr}"
+    # 2) create tweet
+    templates = [
+        "Here's your Nobody PFP 👁️ @{screen_name}",
+        "Your custom Nobody PFP is ready 👁️ @{screen_name}",
+        "All yours 👁️ @{screen_name}",
+        "You asked. We delivered. Nobody PFP 👁️ @{screen_name}",
+        "Cooked just for you 👁️ @{screen_name}",
+        "Made with nothingness 👁️ @{screen_name}",
+        "👁️ For the void... and @{screen_name}",
+    ]
+    text = random.choice(templates).format(screen_name=usr)
+
     try:
-        print(f"📢 Replying to @{usr} (tweet {tid})…")
-        client_v1.update_status(
-            status=reply_text,
-            in_reply_to_status_id=tid,
-            auto_populate_reply_metadata=True,
-            media_ids=[media.media_id_string]
+        print(f"📢 Replying to @{usr}…")
+        client_v2.create_tweet(
+            text=text,
+            in_reply_to_tweet_id=tid,
+            media_ids=[media_key]
         )
-        print(f"🎉 Sent {img_fn} to @{usr}")
+        print(f"✅ Sent {img_name} to @{usr}")
     except Exception as e:
         print(f"❌ Reply failed: {e}")
-        failed.add(usr); save_json_set(failed, FAILED_FILE)
-
+        # rate‐limit → re‐queue and back off
         if "429" in str(e):
-            print("🚫 Rate limit – re-queueing & sleeping 300s…")
-            queue.insert(0, job); save_queue(queue); time.sleep(300)
+            queue.insert(0, job)
+            print("🚫 Rate limit, re-queued and sleeping 60s…")
+            time.sleep(60)
+        failed.add(usr)
+        _save_set(failed, FAILED_FILE)
+        save_queue(queue)
         return
 
     # record success
-    used_imgs.add(img_fn); save_json_set(used_imgs, USED_IMAGES_FILE)
-    recipients.add(usr);  save_json_set(recipients,  RECIPIENTS_FILE)
+    used.add(img_name)
+    recipients.add(usr)
+    _save_set(used, USED_IMAGES_FILE)
+    _save_set(recipients, RECIPIENTS_FILE)
     save_queue(queue)
 
-    # small throttle
-    time.sleep(10)
+    # throttle
+    time.sleep(reply_interval_sec)
