@@ -2,7 +2,6 @@ import os
 import json
 import random
 import requests
-import time
 
 # ──── CONFIG ──────────────────────────────────────────────────────────────────
 USED_IMAGES_FILE   = "/data/used_images.json"
@@ -63,7 +62,6 @@ def download_image(filename):
 
 # ──── QUEUE BUILDER ────────────────────────────────────────────────────────────
 def respond_to_mentions(client_v2, client_v1):
-    """Fetch new mentions via v2, skip RTs, enqueue unique users."""
     recipients   = load_json_set(RECIPIENTS_FILE)
     failed       = load_json_set(FAILED_FILE)
     state        = load_state()
@@ -88,9 +86,7 @@ def respond_to_mentions(client_v2, client_v1):
 
     for tw in reversed(tweets):
         tid = tw.id
-        if tid > (new_last or 0):
-            new_last = tid
-
+        new_last = max(new_last or 0, tid)
         text = tw.text.lower()
         if "create a pfp for me" not in text:
             continue
@@ -110,11 +106,11 @@ def respond_to_mentions(client_v2, client_v1):
     if new_last:
         state["last_seen_id"] = new_last
         save_state(state)
+
     save_queue(queue)
 
-# ──── QUEUE CONSUMER ───────────────────────────────────────────────────────────
+# ──── QUEUE CONSUMER ────────────────────────────────────────────────────────────
 def serve_from_queue(client_v1, client_v2):
-    """Take next job, upload media via v1.1, reply via v2."""
     queue = load_queue()
     if not queue:
         return
@@ -134,6 +130,7 @@ def serve_from_queue(client_v1, client_v2):
     img = get_unused_image(used_images)
     if not img:
         print("⚠️ No unused images left.")
+        save_queue(queue)
         return
 
     img_path = download_image(img)
@@ -146,6 +143,7 @@ def serve_from_queue(client_v1, client_v2):
 
     # 1️⃣ Upload media via v1.1
     try:
+        print(f"📤 Uploading {img}…")
         media = client_v1.media_upload(img_path)
     except Exception as e:
         print(f"❌ Media upload failed: {e}")
@@ -157,7 +155,7 @@ def serve_from_queue(client_v1, client_v2):
         if os.path.exists(TEMP_IMAGE_FILE):
             os.remove(TEMP_IMAGE_FILE)
 
-    # 2️⃣ Post reply via v2
+    # 2️⃣ Reply via v2.create_tweet
     templates = [
         "Here's your Nobody PFP 👁️ @{screen_name}",
         "Your custom Nobody PFP is ready 👁️ @{screen_name}",
@@ -170,6 +168,7 @@ def serve_from_queue(client_v1, client_v2):
     text = random.choice(templates).format(screen_name=usr)
 
     try:
+        print(f"📢 Replying to @{usr} (tweet {tid})…")
         client_v2.create_tweet(
             text=text,
             in_reply_to_tweet_id=tid,
@@ -180,12 +179,11 @@ def serve_from_queue(client_v1, client_v2):
         print(f"❌ Reply failed: {e}")
         failed.add(usr)
         save_json_set(failed, FAILED_FILE)
-        # on rate-limit, re-queue & sleep
+        # on rate-limit, re-queue and bail
         if "429" in str(e):
-            print("🚫 Rate limit — re-queueing and sleeping 60s…")
+            print("🚫 Rate limit — re-queueing…")
             queue.insert(0, job)
-            save_queue(queue)
-            time.sleep(60)
+        save_queue(queue)
         return
 
     # record success
@@ -194,5 +192,3 @@ def serve_from_queue(client_v1, client_v2):
     save_json_set(used_images, USED_IMAGES_FILE)
     save_json_set(recipients, RECIPIENTS_FILE)
     save_queue(queue)
-
-    time.sleep(10)
