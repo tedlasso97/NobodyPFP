@@ -3,6 +3,7 @@ import json
 import random
 import requests
 import time
+import datetime
 
 USED_IMAGES_FILE = "/data/used_images.json"
 RECIPIENTS_FILE = "/data/recipients.json"
@@ -13,6 +14,7 @@ QUEUE_FILE = "/data/queue.json"
 B2_IMAGE_BASE_URL = "https://f004.backblazeb2.com/file/NobodyPFPs/"
 TEMP_IMAGE_FILE = "temp_image.png"
 
+# Load/save helpers
 def load_json_set(path):
     if os.path.exists(path):
         with open(path, "r") as f:
@@ -33,6 +35,7 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
+# Image picker and downloader
 def get_unused_image(used_images):
     all_images = [f"{i}.png" for i in range(0, 10000)]
     available = list(set(all_images) - used_images)
@@ -52,6 +55,7 @@ def download_image(image_filename):
         print(f"Error downloading image from B2: {e}")
         return None
 
+# Queue loading and saving
 def load_queue():
     if os.path.exists(QUEUE_FILE):
         with open(QUEUE_FILE, "r") as f:
@@ -62,7 +66,23 @@ def save_queue(queue):
     with open(QUEUE_FILE, "w") as f:
         json.dump(queue, f)
 
-def respond_to_mentions(client_v2):
+def has_recent_reply(client_v1, screen_name):
+    try:
+        replies = client_v1.user_timeline(count=50, tweet_mode="extended")
+        now = datetime.datetime.utcnow()
+        for tweet in replies:
+            if tweet.in_reply_to_screen_name and screen_name.lower() in tweet.full_text.lower():
+                created_at = tweet.created_at
+                age = (now - created_at).total_seconds()
+                if age <= 6 * 3600:
+                    print(f"🕒 Found recent reply to @{screen_name} ({int(age / 60)} min ago)")
+                    return True
+    except Exception as e:
+        print(f"❌ Error checking recent replies: {e}")
+    return False
+
+# Fetch mentions and populate queue
+def respond_to_mentions(client_v2, client_v1):
     recipients = load_json_set(RECIPIENTS_FILE)
     failed = load_json_set(FAILED_FILE)
     state = load_state()
@@ -116,6 +136,10 @@ def respond_to_mentions(client_v2):
             print(f"⚠️ Skipping @{screen_name} (already queued, served, or failed).")
             continue
 
+        if has_recent_reply(client_v1, screen_name):
+            print(f"⚠️ @{screen_name} was replied to recently. Skipping.")
+            continue
+
         queue.append({
             "tweet_id": tweet_id,
             "author_id": author_id,
@@ -128,6 +152,7 @@ def respond_to_mentions(client_v2):
 
     save_queue(queue)
 
+# Serve replies from queue
 def serve_from_queue(client_v1):
     queue = load_queue()
     used_images = load_json_set(USED_IMAGES_FILE)
