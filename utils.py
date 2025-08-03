@@ -5,14 +5,18 @@ import requests
 import time
 from auth import get_twitter_conn_v1
 
-# Use persistent storage
+# Persistent storage paths
 USED_IMAGES_FILE = "/data/used_images.json"
 RECIPIENTS_FILE = "/data/recipients.json"
 STATE_FILE = "/data/state.json"
 FAILED_FILE = "/data/failed.json"
+QUEUE_FILE = "/data/queue.json"
 
+# Image configuration
 B2_IMAGE_BASE_URL = "https://f004.backblazeb2.com/file/NobodyPFPs/"
 TEMP_IMAGE_FILE = "temp_image.png"
+
+# --- Utility functions ---
 
 def load_json_set(path):
     if os.path.exists(path):
@@ -53,12 +57,24 @@ def download_image(image_filename):
         print(f"Error downloading image from B2: {e}")
         return None
 
+def load_queue():
+    if os.path.exists(QUEUE_FILE):
+        with open(QUEUE_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_queue(queue):
+    with open(QUEUE_FILE, "w") as f:
+        json.dump(queue, f)
+
+# --- Respond: collects eligible tweets into queue ---
+
 def respond_to_mentions(client_v2):
-    used_images = load_json_set(USED_IMAGES_FILE)
     recipients = load_json_set(RECIPIENTS_FILE)
     failed = load_json_set(FAILED_FILE)
     state = load_state()
     last_seen_id = state.get("last_seen_id")
+    queue = load_queue()
 
     try:
         print("🔍 Searching for new mentions...")
@@ -79,8 +95,9 @@ def respond_to_mentions(client_v2):
         return
 
     new_last_seen_id = last_seen_id
+    queued_ids = {item['tweet_id'] for item in queue}
 
-    for tweet in reversed(response.data):  # Oldest first
+    for tweet in reversed(response.data):
         print(f"📨 Processing tweet ID {tweet.id} with text: {tweet.text}")
         text = tweet.text.lower()
         author_id = tweet.author_id
@@ -102,61 +119,98 @@ def respond_to_mentions(client_v2):
             print("❌ Error fetching user info:", e)
             continue
 
-        if screen_name in recipients or screen_name in failed:
-            print(f"⚠️ Skipping @{screen_name} (already served or failed).")
+        if tweet_id in queued_ids or screen_name in recipients or screen_name in failed:
+            print(f"⚠️ Skipping @{screen_name} (already queued, served, or failed).")
             continue
 
-        image_file = get_unused_image(used_images)
-        if not image_file:
-            print("⚠️ No more unused images.")
-            return
-
-        image_path = download_image(image_file)
-        if not image_path:
-            print("❌ Failed to download image. Skipping.")
-            failed.add(screen_name)
-            continue
-
-        try:
-            print("📤 Uploading image...")
-            client_v1 = get_twitter_conn_v1()
-            media = client_v1.media_upload(image_path)
-            print("✅ Uploaded media")
-        except Exception as e:
-            print("❌ Error uploading media:", e)
-            failed.add(screen_name)
-            continue
-        finally:
-            if os.path.exists(TEMP_IMAGE_FILE):
-                os.remove(TEMP_IMAGE_FILE)
-
-        try:
-            print("📢 Posting reply tweet...")
-            client_v2.create_tweet(
-                text=f"Here is your Nobody PFP @{screen_name}",
-                in_reply_to_tweet_id=tweet_id,
-                media_ids=[media.media_id]
-            )
-            print(f"🎉 Sent PFP {image_file} to @{screen_name}")
-        except Exception as e:
-            print("❌ Error posting tweet:", e)
-            failed.add(screen_name)
-
-            if "429" in str(e):
-                print("🚫 Rate limit hit — sleeping for 60 seconds.")
-                time.sleep(60)
-            continue
-
-        used_images.add(image_file)
-        recipients.add(screen_name)
-        save_json_set(used_images, USED_IMAGES_FILE)
-        save_json_set(recipients, RECIPIENTS_FILE)
-
-        # Delay between tweets to avoid rate limit
-        time.sleep(5)
+        queue.append({
+            "tweet_id": tweet_id,
+            "author_id": author_id,
+            "screen_name": screen_name
+        })
 
     if new_last_seen_id:
         state["last_seen_id"] = new_last_seen_id
         save_state(state)
 
-    save_json_set(failed, FAILED_FILE)
+    save_queue(queue)
+
+# --- Serve: reply to one tweet from queue ---
+
+def serve_from_queue(client_v2):
+    queue = load_queue()
+    used_images = load_json_set(USED_IMAGES_FILE)
+    recipients = load_json_set(RECIPIENTS_FILE)
+    failed = load_json_set(FAILED_FILE)
+
+    print(f"📋 Queue length: {len(queue)}")
+
+    if not queue:
+        print("ℹ️ No users in queue.")
+        return
+
+    current = queue.pop(0)
+    tweet_id = current["tweet_id"]
+    screen_name = current["screen_name"]
+
+    if screen_name in recipients or screen_name in failed:
+        print(f"⚠️ @{screen_name} already handled. Skipping.")
+        save_queue(queue)
+        return
+
+    image_file = get_unused_image(used_images)
+    if not image_file:
+        print("⚠️ No more unused images.")
+        return
+
+    image_path = download_image(image_file)
+    if not image_path:
+        print("❌ Failed to download image. Skipping.")
+        failed.add(screen_name)
+        save_json_set(failed, FAILED_FILE)
+        save_queue(queue)
+        return
+
+    try:
+        print("📤 Uploading image...")
+        client_v1 = get_twitter_conn_v1()
+        media = client_v1.media_upload(image_path)
+        print("✅ Uploaded media")
+    except Exception as e:
+        print("❌ Error uploading media:", e)
+        failed.add(screen_name)
+        save_json_set(failed, FAILED_FILE)
+        save_queue(queue)
+        return
+    finally:
+        if os.path.exists(TEMP_IMAGE_FILE):
+            os.remove(TEMP_IMAGE_FILE)
+
+    try:
+        print("📢 Posting reply tweet...")
+        client_v2.create_tweet(
+            text=f"Here is your Nobody PFP @{screen_name}",
+            in_reply_to_tweet_id=tweet_id,
+            media_ids=[media.media_id]
+        )
+        print(f"🎉 Sent PFP {image_file} to @{screen_name}")
+    except Exception as e:
+        print("❌ Error posting tweet:", e)
+        failed.add(screen_name)
+        save_json_set(failed, FAILED_FILE)
+
+        if "429" in str(e):
+            print("🚫 Rate limit hit — sleeping for 60 seconds.")
+            time.sleep(60)
+
+        save_queue(queue)
+        return
+
+    used_images.add(image_file)
+    recipients.add(screen_name)
+    save_json_set(used_images, USED_IMAGES_FILE)
+    save_json_set(recipients, RECIPIENTS_FILE)
+    save_queue(queue)
+
+    # Sleep to prevent rate limits
+    time.sleep(10)
