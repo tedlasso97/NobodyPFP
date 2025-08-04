@@ -1,17 +1,13 @@
-import os
-import json
-import random
-import time
-import requests
+import os, json, random, time, requests
 from auth import get_twitter_conn_v1
 
-# ───── CONFIG ────────────────────────────────────────────────────────────
-USED_IMAGES_FILE   = "/data/used_images.json"
-RECIPIENTS_FILE    = "/data/recipients.json"
-STATE_FILE         = "/data/state.json"
-IMAGES_DIR         = "images"   # your local folder of 0–9999.png
-B2_BASE_URL        = "https://f004.backblazeb2.com/file/NobodyPFPs/"
-TEMP_FILE          = "temp.png"
+# ─── CONFIG ────────────────────────────────────────────────────────────────
+USED_IMAGES_FILE = "/data/used_images.json"
+RECIPIENTS_FILE  = "/data/recipients.json"
+STATE_FILE       = "/data/state.json"
+IMAGES_DIR       = "images"    # your local folder of 0–9999.png
+B2_BASE_URL      = "https://f004.backblazeb2.com/file/NobodyPFPs/"
+TEMP_FILE        = "temp.png"
 
 REPLY_TEMPLATES = [
     "Here's your Nobody PFP 👁️ @{screen_name}",
@@ -23,16 +19,14 @@ REPLY_TEMPLATES = [
     "👁️ For the void... and @{screen_name}",
 ]
 
-# ───── LOW-LEVEL HELPERS ───────────────────────────────────────────────────
+# ─── HELPERS ────────────────────────────────────────────────────────────────
 def _load(path, default):
     if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
+        with open(path) as f: return json.load(f)
     return default
 
 def _save(obj, path):
-    with open(path, "w") as f:
-        json.dump(obj, f)
+    with open(path, "w") as f: json.dump(obj, f)
 
 def load_state():
     return _load(STATE_FILE, {"last_seen_id": None})
@@ -46,7 +40,7 @@ def load_set(path):
 def save_set(s, path):
     _save(list(s), path)
 
-# ───── IMAGE FUNCTIONS ─────────────────────────────────────────────────────
+# ─── IMAGE ──────────────────────────────────────────────────────────────────
 def pick_image(used):
     all_imgs = os.listdir(IMAGES_DIR)
     avail    = list(set(all_imgs) - used)
@@ -55,43 +49,20 @@ def pick_image(used):
 def download_img(fn):
     url = f"{B2_BASE_URL}{fn}"
     r   = requests.get(url); r.raise_for_status()
-    with open(TEMP_FILE, "wb") as f:
-        f.write(r.content)
+    with open(TEMP_FILE, "wb") as f: f.write(r.content)
     return TEMP_FILE
 
-# ───── BOOTSTRAP EXISTING REPLIES ──────────────────────────────────────────
-def bootstrap_recipients(client_v2):
-    """Scan your bot’s own recent tweets for replies and seed recipients.json."""
-    recipients = load_set(RECIPIENTS_FILE)
-    try:
-        me = client_v2.get_me().data
-        resp = client_v2.get_users_tweets(
-            me.id,
-            max_results=100,
-            tweet_fields=["in_reply_to_user_id"]
-        )
-        for tw in resp.data or []:
-            rid = tw.in_reply_to_user_id
-            if rid:
-                user = client_v2.get_user(id=rid).data.username.lower()
-                recipients.add(user)
-    except Exception as e:
-        print("❌ bootstrap error:", e)
-    save_set(recipients, RECIPIENTS_FILE)
-    return recipients
-
-# ───── MAIN PASS ───────────────────────────────────────────────────────────
+# ─── MAIN LOOP ──────────────────────────────────────────────────────────────
 def run_once(client_v2):
+    # prep
     v1         = get_twitter_conn_v1()
     state      = load_state()
     last_seen  = state.get("last_seen_id")
-
     used_imgs  = load_set(USED_IMAGES_FILE)
-    # merge in any manual or prior replies
-    recipients = bootstrap_recipients(client_v2)
+    recipients = load_set(RECIPIENTS_FILE)
     new_last   = last_seen
 
-    # 1) Fetch
+    # fetch up to 50 new mentions (avoid RTs)
     resp = client_v2.search_recent_tweets(
         query="@nobodypfp create a PFP for me -is:retweet",
         since_id=last_seen,
@@ -105,6 +76,7 @@ def run_once(client_v2):
         if not new_last or tid > new_last:
             new_last = tid
 
+        # filter exact trigger
         if "create a pfp for me" not in tw.text.lower():
             continue
 
@@ -112,16 +84,16 @@ def run_once(client_v2):
         if user in recipients:
             continue
 
-        # 2) Pick & download image
+        # pick & download
         img = pick_image(used_imgs)
         if not img:
-            print("⚠️ Out of images.")
+            print("⚠️ Out of images.")
             break
         path = download_img(img)
 
-        # 3) Upload & reply via v1.1
+        # upload & reply
         try:
-            m = v1.media_upload(path)
+            m   = v1.media_upload(path)
             txt = random.choice(REPLY_TEMPLATES).format(screen_name=user)
             v1.update_status(
                 status=txt,
@@ -129,19 +101,19 @@ def run_once(client_v2):
                 auto_populate_reply_metadata=True,
                 media_ids=[m.media_id_string]
             )
-            print(f"🎉 replied to @{user}")
+            print(f"🎉 Replied to @{user}")
         except Exception as e:
-            print(f"❌ failed to reply @{user}:", e)
-            break  # on rate-limit or forbidden, stop this run
+            print(f"❌ Reply to @{user} failed:", e)
+            break
 
-        # 4) Record success
+        # record
         used_imgs.add(img)
         recipients.add(user)
         save_set(used_imgs, USED_IMAGES_FILE)
         save_set(recipients, RECIPIENTS_FILE)
 
-        time.sleep(2)  # small throttle
+        time.sleep(2)
 
-    # 5) Persist new cursor
+    # persist cursor
     if new_last and new_last != last_seen:
         save_state({"last_seen_id": new_last})
