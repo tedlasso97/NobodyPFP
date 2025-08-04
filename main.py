@@ -2,27 +2,26 @@
 import time
 from apscheduler.schedulers.blocking import BlockingScheduler
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
-from auth import get_twitter_conn_v1, get_twitter_conn_v2
-import utils
+from auth import get_twitter_conn_v2
+from utils import respond_to_mentions, serve_from_queue
 
-client_v1 = get_twitter_conn_v1()  # v1 for media & update_status
-client_v2 = get_twitter_conn_v2()  # v2 for search & user lookup
+client_v2 = get_twitter_conn_v2()
 
-def run_enqueue():
-    now = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Edmonton"))
-    print(f"[{now:%Y-%m-%d %H:%M:%S}] 🤖 batch_enqueue")
-    utils.batch_enqueue(client_v2)
+def job_fetch():
+    now = datetime.now(timezone.utc).astimezone()
+    print(f"[{now:%Y-%m-%d %H:%M:%S}] 🔍 Fetching & enqueuing…")
+    respond_to_mentions(client_v2)
 
-def run_drip():
-    now = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Edmonton"))
-    print(f"[{now:%Y-%m-%d %H:%M:%S}] 🤖 drip_reply")
-    utils.drip_reply(client_v1)
+def job_serve():
+    now = datetime.now(timezone.utc).astimezone()
+    print(f"[{now:%Y-%m-%d %H:%M:%S}] 🤖 Drip-serving replies…")
+    serve_from_queue(client_v2)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     scheduler = BlockingScheduler()
-    scheduler.add_job(run_enqueue, 'interval', minutes=10)
-    scheduler.add_job(run_drip,     'interval', minutes=5)
-    print("✅ Nobody bot started — batch every 10 m, drip every 5 m.")
+    # pull new mentions every 2m, drip replies every 1m (or adjust)
+    scheduler.add_job(job_fetch, 'interval', minutes=2)
+    scheduler.add_job(job_serve, 'interval', minutes=1)
+    print("✅ Nobody bot started — fetch every 2m, reply drip every 1m.")
     scheduler.start()
